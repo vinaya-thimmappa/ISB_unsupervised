@@ -1,71 +1,115 @@
+import cv2
 import streamlit as st
 import pandas as pd
+from deepface import DeepFace
 
+# Function to analyze emotions using DeepFace
+def analyze_emotion():
+    cap = cv2.VideoCapture(0)
+    stframe = st.empty()  # Placeholder for webcam feed
+
+    if "captured_emotions" not in st.session_state:
+        st.session_state["captured_emotions"] = []
+
+    stop_button = st.button("Stop Emotion Capture")
+
+    while not stop_button:
+        ret, frame = cap.read()
+        if not ret:
+            st.warning("Failed to capture frame. Exiting...")
+            break
+
+        try:
+            # Analyze the frame for emotions
+            result = DeepFace.analyze(img_path=frame, actions=['emotion'], enforce_detection=False, silent=True)
+            dominant_emotion = result[0]["dominant_emotion"]
+
+            # Overlay dominant emotion on the frame
+            cv2.putText(frame, f"Emotion: {dominant_emotion}", (50, 50), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
+
+            # Add the emotion to the session state
+            st.session_state["captured_emotions"].append(dominant_emotion)
+
+            # Convert BGR to RGB for Streamlit
+            frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            stframe.image(frame_rgb, channels="RGB")
+
+        except Exception as e:
+            st.error(f"Error analyzing frame: {e}")
+
+    # Release the webcam
+    cap.release()
+    cv2.destroyAllWindows()
+
+# Function to load movies from a file
 def load_movies(file_path):
-    """Load and clean movie names from a file."""
     try:
-        # Load movies into a DataFrame
-        movies = pd.read_csv(file_path, header=None, names=["Movie Name"])
-        movies.dropna(inplace=True)  # Remove NaN rows
-        movies["Movie Name"] = movies["Movie Name"].str.strip()  # Strip extra spaces
+        movies = pd.read_csv(file_path, header=None, names=["Movie Name"], sep=",")
+        movies.dropna(inplace=True)
+        movies["Movie Name"] = movies["Movie Name"].astype(str).str.strip().str.rstrip(",")
         return movies["Movie Name"].tolist()
     except Exception as e:
-        st.error(f"Error loading file: {e}")
+        st.error(f"Error loading movie file: {e}")
         return []
 
-def main():
-    st.title("Movie Selector App")
-    st.write("Upload a file with movie names and search for your favorite movies.")
+# Combined App: Movies and Emotions Independently
+def movie_selector_and_emotion():
+    st.title("Movie Selector and Emotion Capture")
 
-    # File upload
+    # Section 1: Movie Selector
+    st.subheader("Movie Selector")
     uploaded_file = st.file_uploader("Upload your movie file (CSV format with one column for movie names):")
-
     if uploaded_file:
-        # Load and clean movie names
         movie_list = load_movies(uploaded_file)
-
         if movie_list:
-            st.success(f"Successfully loaded {len(movie_list)} movies.")
-            
-            # Session state to track selected movies
-            if "selected_movies" not in st.session_state:
-                st.session_state.selected_movies = []
+            # Maintain a session state for selected movies
+            st.session_state["selected_movies"] = st.session_state.get("selected_movies", [])
 
-            # Limit selections to 5 movies
-            if len(st.session_state.selected_movies) < 5:
-                # Single search box for dynamic filtering
-                query = st.text_input("Search movies:", key="search_input")
+            # Dropdown for movie selection
+            movie_selected = st.selectbox("Select a movie to add to your list:", movie_list)
 
-                # Filter the movie list based on the query
-                if query and len(query) >= 3:
-                    filtered_movies = [movie for movie in movie_list if query.lower() in movie.lower()]
-                    
-                    if filtered_movies:
-                        selected_movie = st.selectbox(
-                            "Select a movie:", 
-                            filtered_movies, 
-                            key="movie_select"
-                        )
-                        
-                        # Add selected movie to the list if not already added
-                        if selected_movie and selected_movie not in st.session_state.selected_movies:
-                            if st.button("Add Movie"):
-                                st.session_state.selected_movies.append(selected_movie)
-                                st.success(f"Added: {selected_movie}")
-                    else:
-                        st.warning("No movies found matching your query.")
-                else:
-                    st.info("Type at least 3 characters to search.")
-            else:
-                st.warning("You have already selected 5 movies. No more can be added.")
+            if st.button("Add Movie"):
+                if movie_selected not in st.session_state["selected_movies"]:
+                    st.session_state["selected_movies"].append(movie_selected)
+                    st.success(f"Added '{movie_selected}' to your list!")
 
             # Display selected movies
-            if st.session_state.selected_movies:
-                st.subheader("Selected Movies:")
-                st.write(st.session_state.selected_movies)
-
+            st.write("Your Selected Movies:")
+            for movie in st.session_state["selected_movies"]:
+                st.write(f"- {movie}")
         else:
-            st.warning("No movies found in the file.")
+            st.warning("No movies found in the uploaded file.")
+    else:
+        st.info("Please upload a movie file to proceed.")
+
+    # Section 2: Real-Time Emotion Analysis
+    st.subheader("Real-Time Emotion Analysis")
+    st.write("Activate your webcam to capture real-time emotions.")
+    if st.button("Start Emotion Capture"):
+        analyze_emotion()
+
+    # Display captured emotions
+    st.subheader("Captured Emotions:")
+    if "captured_emotions" in st.session_state and st.session_state["captured_emotions"]:
+        for emotion in st.session_state["captured_emotions"]:
+            st.write(f"- {emotion}")
+    else:
+        st.info("No emotions captured yet.")
+
+# Main function
+def main():
+    st.sidebar.title("Menu")
+    activities = ["Movies and Emotions", "About"]
+    choice = st.sidebar.selectbox("Select Activity", activities)
+
+    if choice == "Movies and Emotions":
+        movie_selector_and_emotion()
+    elif choice == "About":
+        st.write("This application allows users to select movies and analyze emotions in real-time independently.")
+        st.markdown("""
+        **Developer:** Shrimanta Satpati  
+        **Email:** satpatishrimanta@gmail.com
+        """)
 
 if __name__ == "__main__":
     main()
