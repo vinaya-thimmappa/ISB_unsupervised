@@ -1,2 +1,9 @@
-opencv-python
-deepface
+torch
+transformers
+streamlit
+pandas
+numpy
+scikit-learn
+scipy
+transformers
+urllib3
