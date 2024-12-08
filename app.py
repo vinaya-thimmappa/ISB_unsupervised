@@ -1,115 +1,141 @@
-import cv2
 import streamlit as st
 import pandas as pd
-from deepface import DeepFace
+import numpy as np
+import os
+from zipfile import ZipFile
+from sklearn.neighbors import NearestNeighbors
+from sklearn.metrics.pairwise import cosine_similarity
+from scipy.sparse import csr_matrix
+from scipy.sparse.linalg import svds
+from sklearn.ensemble import RandomForestRegressor
+from sklearn.decomposition import TruncatedSVD
+from transformers import pipeline
+import urllib.request
 
-# Function to analyze emotions using DeepFace
-def analyze_emotion():
-    cap = cv2.VideoCapture(0)
-    stframe = st.empty()  # Placeholder for webcam feed
+# Initialize emotion classifier
+emotion_classifier = pipeline("text-classification", model="j-hartmann/emotion-english-distilroberta-base", return_all_scores=True)
 
-    if "captured_emotions" not in st.session_state:
-        st.session_state["captured_emotions"] = []
+# Dataset Configurations
+DATASET_URL = "http://files.grouplens.org/datasets/movielens/ml-100k.zip"
+ZIP_FILE = "ml-100k.zip"
+EXTRACT_DIR = "ml-100k"
 
-    stop_button = st.button("Stop Emotion Capture")
+# Load MovieLens Dataset
+@st.cache_data
+def load_movielens_data():
+    if not os.path.exists(ZIP_FILE):
+        st.info("Downloading dataset... Please wait.")
+        urllib.request.urlretrieve(DATASET_URL, ZIP_FILE)
 
-    while not stop_button:
-        ret, frame = cap.read()
-        if not ret:
-            st.warning("Failed to capture frame. Exiting...")
-            break
+    if not os.path.exists(EXTRACT_DIR):
+        with ZipFile(ZIP_FILE, 'r') as zip_ref:
+            zip_ref.extractall(EXTRACT_DIR)
 
-        try:
-            # Analyze the frame for emotions
-            result = DeepFace.analyze(img_path=frame, actions=['emotion'], enforce_detection=False, silent=True)
-            dominant_emotion = result[0]["dominant_emotion"]
+    correct_path = os.path.join(EXTRACT_DIR, "ml-100k") if os.path.exists(os.path.join(EXTRACT_DIR, "ml-100k")) else EXTRACT_DIR
 
-            # Overlay dominant emotion on the frame
-            cv2.putText(frame, f"Emotion: {dominant_emotion}", (50, 50), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
+    movies_file = os.path.join(correct_path, "u.item")
+    ratings_file = os.path.join(correct_path, "u.data")
 
-            # Add the emotion to the session state
-            st.session_state["captured_emotions"].append(dominant_emotion)
+    if not (os.path.exists(movies_file) and os.path.exists(ratings_file)):
+        raise FileNotFoundError("Required dataset files not found. Please check the extraction.")
 
-            # Convert BGR to RGB for Streamlit
-            frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            stframe.image(frame_rgb, channels="RGB")
+    movies_columns = ['movie_id', 'title']
+    ratings_columns = ['user_id', 'movie_id', 'rating', 'timestamp']
 
-        except Exception as e:
-            st.error(f"Error analyzing frame: {e}")
+    movies = pd.read_csv(movies_file, sep='|', encoding='latin-1', names=movies_columns, usecols=[0, 1])
+    ratings = pd.read_csv(ratings_file, sep='\t', names=ratings_columns, encoding='latin-1')
 
-    # Release the webcam
-    cap.release()
-    cv2.destroyAllWindows()
+    merged_data = pd.merge(ratings, movies, on='movie_id')
+    user_item_matrix = merged_data.pivot_table(index='user_id', columns='title', values='rating').fillna(0)
+    user_item_sparse = csr_matrix(user_item_matrix.values)
 
-# Function to load movies from a file
-def load_movies(file_path):
-    try:
-        movies = pd.read_csv(file_path, header=None, names=["Movie Name"], sep=",")
-        movies.dropna(inplace=True)
-        movies["Movie Name"] = movies["Movie Name"].astype(str).str.strip().str.rstrip(",")
-        return movies["Movie Name"].tolist()
-    except Exception as e:
-        st.error(f"Error loading movie file: {e}")
-        return []
+    return movies, merged_data, user_item_matrix, user_item_sparse
 
-# Combined App: Movies and Emotions Independently
-def movie_selector_and_emotion():
-    st.title("Movie Selector and Emotion Capture")
+# Recommendation Models
+def knn_recommend(user_id, top_n, user_item_sparse, user_item_matrix):
+    knn_model = NearestNeighbors(metric='cosine', algorithm='brute')
+    knn_model.fit(user_item_sparse)
+    distances, indices = knn_model.kneighbors(user_item_sparse[user_id - 1], n_neighbors=top_n + 1)
+    recommended_movies = user_item_matrix.columns[indices.flatten()[1:]]
+    return recommended_movies.tolist()
 
-    # Section 1: Movie Selector
-    st.subheader("Movie Selector")
-    uploaded_file = st.file_uploader("Upload your movie file (CSV format with one column for movie names):")
-    if uploaded_file:
-        movie_list = load_movies(uploaded_file)
-        if movie_list:
-            # Maintain a session state for selected movies
-            st.session_state["selected_movies"] = st.session_state.get("selected_movies", [])
+def svd_recommend(user_id, top_n, user_item_sparse, user_item_matrix):
+    U, sigma, Vt = svds(user_item_sparse, k=50)
+    predicted_ratings = np.dot(np.dot(U, np.diag(sigma)), Vt)
+    predicted_ratings_df = pd.DataFrame(predicted_ratings, index=user_item_matrix.index, columns=user_item_matrix.columns)
+    user_pred = predicted_ratings_df.loc[user_id].sort_values(ascending=False).head(top_n)
+    return user_pred.index.tolist()
 
-            # Dropdown for movie selection
-            movie_selected = st.selectbox("Select a movie to add to your list:", movie_list)
+def random_forest_recommend(user_id, top_n, user_item_matrix):
+    svd = TruncatedSVD(n_components=50, random_state=42)
+    user_item_reduced = svd.fit_transform(user_item_matrix)
+    rf_model = RandomForestRegressor(n_estimators=100, random_state=42)
+    X = user_item_reduced
+    y = user_item_matrix.values
 
-            if st.button("Add Movie"):
-                if movie_selected not in st.session_state["selected_movies"]:
-                    st.session_state["selected_movies"].append(movie_selected)
-                    st.success(f"Added '{movie_selected}' to your list!")
+    valid_ratings_mask = y > 0
+    row_indices, col_indices = np.where(valid_ratings_mask)
+    X_filtered = X[row_indices]
+    y_filtered = y[valid_ratings_mask]
 
-            # Display selected movies
-            st.write("Your Selected Movies:")
-            for movie in st.session_state["selected_movies"]:
-                st.write(f"- {movie}")
-        else:
-            st.warning("No movies found in the uploaded file.")
-    else:
-        st.info("Please upload a movie file to proceed.")
+    rf_model.fit(X_filtered, y_filtered)
+    user_index = user_id - 1
+    user_features = user_item_reduced[user_index].reshape(1, -1)
+    predicted_ratings = rf_model.predict(np.repeat(user_features, len(user_item_matrix.columns), axis=0))
+    recommended_movies = user_item_matrix.columns[np.argsort(-predicted_ratings)[:top_n]]
+    return recommended_movies.tolist()
 
-    # Section 2: Real-Time Emotion Analysis
-    st.subheader("Real-Time Emotion Analysis")
-    st.write("Activate your webcam to capture real-time emotions.")
-    if st.button("Start Emotion Capture"):
-        analyze_emotion()
-
-    # Display captured emotions
-    st.subheader("Captured Emotions:")
-    if "captured_emotions" in st.session_state and st.session_state["captured_emotions"]:
-        for emotion in st.session_state["captured_emotions"]:
-            st.write(f"- {emotion}")
-    else:
-        st.info("No emotions captured yet.")
-
-# Main function
+# Streamlit Application
 def main():
-    st.sidebar.title("Menu")
-    activities = ["Movies and Emotions", "About"]
-    choice = st.sidebar.selectbox("Select Activity", activities)
+    st.title("🎥 Movie Recommender & Emotion Analysis")
 
-    if choice == "Movies and Emotions":
-        movie_selector_and_emotion()
-    elif choice == "About":
-        st.write("This application allows users to select movies and analyze emotions in real-time independently.")
-        st.markdown("""
-        **Developer:** Shrimanta Satpati  
-        **Email:** satpatishrimanta@gmail.com
-        """)
+    # Initialize session state
+    if "selected_movies" not in st.session_state:
+        st.session_state.selected_movies = []
+    if "recommendations" not in st.session_state:
+        st.session_state.recommendations = []
+
+    # Load Data
+    movies, merged_data, user_item_matrix, user_item_sparse = load_movielens_data()
+    user_id = 1  # Fixed User ID Assumption
+
+    # Model Selection
+    selected_model = st.radio("Choose Model:", ["All Models", "KNN", "SVD", "Random Forest"])
+
+    # Run Model Button
+    if st.button("Run Model"):
+        if selected_model == "All Models":
+            knn_recs = knn_recommend(user_id, 10, user_item_sparse, user_item_matrix)
+            svd_recs = svd_recommend(user_id, 10, user_item_sparse, user_item_matrix)
+            rf_recs = random_forest_recommend(user_id, 10, user_item_matrix)
+            st.session_state.recommendations = list(set(knn_recs + svd_recs + rf_recs))
+        elif selected_model == "KNN":
+            st.session_state.recommendations = knn_recommend(user_id, 10, user_item_sparse, user_item_matrix)
+        elif selected_model == "SVD":
+            st.session_state.recommendations = svd_recommend(user_id, 10, user_item_sparse, user_item_matrix)
+        elif selected_model == "Random Forest":
+            st.session_state.recommendations = random_forest_recommend(user_id, 10, user_item_matrix)
+
+    # Select 5 Movies
+    st.session_state.selected_movies = st.multiselect(
+        "Select 5 Movies from Recommendations:", st.session_state.recommendations, default=st.session_state.selected_movies
+    )
+
+    # Show Analyze Emotions Button After Selection
+    if len(st.session_state.selected_movies) == 5:
+        st.subheader("Your Selected Movies")
+        st.write(st.session_state.selected_movies)
+
+        if st.button("Analyze Emotions"):
+            st.subheader("**Emotion Analysis Results**")
+            for movie in st.session_state.selected_movies:
+                detailed_emotions = emotion_classifier(movie)
+                sorted_emotions = sorted(detailed_emotions[0], key=lambda x: x['score'], reverse=True)
+
+                st.write(f"**{movie}**")
+                st.write("**Detailed Emotion Analysis:**")
+                for emotion in sorted_emotions[:3]:
+                    st.write(f"{emotion['label']}: {round(emotion['score'], 2)}")
 
 if __name__ == "__main__":
     main()
